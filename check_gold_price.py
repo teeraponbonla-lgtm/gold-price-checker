@@ -5,11 +5,13 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import ssl
 import sys
 import urllib.error
+import urllib.parse
 import urllib.request
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Any
 
 
@@ -19,6 +21,11 @@ DEFAULT_SYMBOLS = [
     "FOREXCOM:XAUUSD",
     "FX_IDC:XAUUSD",
     "TVC:GOLD",
+]
+TELEGRAM_GROUP_ENV_NAMES = [
+    "TELEGRAM_GROUP_CHAT_ID_001",
+    "TELEGRAM_GROUP_CHAT_ID_002",
+    "TELEGRAM_GROUP_CHAT_ID_003",
 ]
 
 
@@ -107,6 +114,63 @@ def format_quote(row: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def telegram_message(quote: dict[str, Any]) -> str:
+    checked_at_th = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime(
+        "%d/%m/%Y %H:%M"
+    )
+    change_abs = quote["change_abs"]
+    change_percent = quote["change_percent"]
+    return (
+        "AI GOLD PRICE CHECKER\n\n"
+        f"เวลาไทย: {checked_at_th}\n"
+        f"ราคา: {quote['close']} {quote['currency']}\n"
+        f"เปลี่ยนแปลง: {change_abs:+.3f} ({change_percent:+.2f}%)\n"
+        f"Symbol: {quote['symbol']} ({quote['description']})\n"
+        f"Exchange: {quote['exchange']}\n"
+        f"Source: {quote['source']}\n"
+        f"Chart: {quote['chart_url']}"
+    )
+
+
+def send_telegram_message(text: str, insecure: bool = False) -> int:
+    token = os.environ.get("TELEGRAM_TOKEN")
+    chat_ids = [os.environ.get("TELEGRAM_CHAT_ID")]
+    chat_ids.extend(os.environ.get(name) for name in TELEGRAM_GROUP_ENV_NAMES)
+    chat_ids = [chat_id for chat_id in chat_ids if chat_id]
+
+    if not token:
+        print("Telegram skipped: TELEGRAM_TOKEN is not set.")
+        return 0
+    if not chat_ids:
+        print("Telegram skipped: no TELEGRAM_CHAT_ID or group chat ids are set.")
+        return 0
+
+    sent = 0
+    for chat_id in chat_ids:
+        data = urllib.parse.urlencode({"chat_id": chat_id, "text": text}).encode(
+            "utf-8"
+        )
+        request = urllib.request.Request(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            data=data,
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(
+                request, timeout=20, context=ssl_context(insecure=insecure)
+            ) as response:
+                response.read()
+            print(f"Telegram sent to {chat_id}.")
+            sent += 1
+        except urllib.error.HTTPError as exc:
+            detail = exc.read().decode("utf-8", errors="replace")
+            print(f"Telegram failed for {chat_id}: HTTP {exc.code} {detail}")
+        except urllib.error.URLError as exc:
+            print(f"Telegram failed for {chat_id}: {exc.reason}")
+
+    return sent
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
         description="Fetch latest gold price data from TradingView."
@@ -127,6 +191,11 @@ def main() -> int:
         action="store_true",
         help="Skip TLS certificate verification. Use only for local testing behind a corporate proxy.",
     )
+    parser.add_argument(
+        "--no-telegram",
+        action="store_true",
+        help="Do not send the result to Telegram even when Telegram environment variables are set.",
+    )
     args = parser.parse_args()
 
     try:
@@ -135,6 +204,9 @@ def main() -> int:
     except Exception as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         return 1
+
+    if not args.no_telegram:
+        send_telegram_message(telegram_message(quote), insecure=args.insecure)
 
     if args.json:
         print(json.dumps(quote, ensure_ascii=False, indent=2))
