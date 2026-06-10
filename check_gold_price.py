@@ -16,6 +16,41 @@ from typing import Any
 
 
 TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/global/scan"
+BASE_COLUMNS = [
+    "name",
+    "description",
+    "exchange",
+    "type",
+    "subtype",
+    "close",
+    "change",
+    "change_abs",
+    "currency",
+    "update_mode",
+]
+TIMEFRAMES = [
+    ("M15", "15"),
+    ("H1", "60"),
+    ("H4", "240"),
+    ("D1", ""),
+]
+INDICATOR_COLUMNS = [
+    "SMA20",
+    "SMA21",
+    "SMA50",
+    "SMA100",
+    "SMA200",
+    "RSI",
+    "Stoch.K",
+    "Stoch.D",
+    "MACD.macd",
+    "MACD.signal",
+]
+TRADINGVIEW_COLUMNS = BASE_COLUMNS + [
+    f"{column}|{interval}" if interval else column
+    for _, interval in TIMEFRAMES
+    for column in INDICATOR_COLUMNS
+]
 DEFAULT_SYMBOLS = [
     "OANDA:XAUUSD",
     "FOREXCOM:XAUUSD",
@@ -44,18 +79,7 @@ def ssl_context(insecure: bool = False) -> ssl.SSLContext:
 def fetch_quote(symbols: list[str], insecure: bool = False) -> dict[str, Any]:
     payload = {
         "symbols": {"tickers": symbols, "query": {"types": []}},
-        "columns": [
-            "name",
-            "description",
-            "exchange",
-            "type",
-            "subtype",
-            "close",
-            "change",
-            "change_abs",
-            "currency",
-            "update_mode",
-        ],
+        "columns": TRADINGVIEW_COLUMNS,
     }
 
     request = urllib.request.Request(
@@ -88,15 +112,46 @@ def fetch_quote(symbols: list[str], insecure: bool = False) -> dict[str, Any]:
 
     for row in rows:
         values = row.get("d") or []
-        if len(values) >= 6 and values[5] is not None:
+        if len(values) >= len(TRADINGVIEW_COLUMNS) and values[5] is not None:
             return {"symbol": row.get("s"), "values": values}
 
-    raise RuntimeError("TradingView returned rows, but none included a latest price.")
+    raise RuntimeError(
+        "TradingView returned rows, but none included the full price and indicator set."
+    )
 
 
 def format_quote(row: dict[str, Any]) -> dict[str, Any]:
     values = row["values"]
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
+    indicators = {}
+    offset = len(BASE_COLUMNS)
+    for label, _ in TIMEFRAMES:
+        frame_values = values[offset : offset + len(INDICATOR_COLUMNS)]
+        macd = frame_values[8]
+        macd_signal = frame_values[9]
+        indicators[label] = {
+            "ma": {
+                "ma20": frame_values[0],
+                "ma21": frame_values[1],
+                "ma50": frame_values[2],
+                "ma100": frame_values[3],
+                "ma200": frame_values[4],
+            },
+            "rsi": frame_values[5],
+            "stoch": {
+                "k": frame_values[6],
+                "d": frame_values[7],
+            },
+            "macd": {
+                "macd": macd,
+                "signal": macd_signal,
+                "histogram": macd - macd_signal
+                if macd is not None and macd_signal is not None
+                else None,
+            },
+        }
+        offset += len(INDICATOR_COLUMNS)
+
     return {
         "checked_at_utc": now,
         "source": "TradingView scanner",
@@ -111,7 +166,14 @@ def format_quote(row: dict[str, Any]) -> dict[str, Any]:
         "change_abs": values[7],
         "currency": values[8],
         "update_mode": values[9],
+        "timeframes": indicators,
     }
+
+
+def fmt_number(value: Any, digits: int = 2) -> str:
+    if value is None:
+        return "N/A"
+    return f"{float(value):,.{digits}f}"
 
 
 def telegram_message(quote: dict[str, Any]) -> str:
@@ -120,16 +182,33 @@ def telegram_message(quote: dict[str, Any]) -> str:
     )
     change_abs = quote["change_abs"]
     change_percent = quote["change_percent"]
-    return (
+    message = (
         "AI GOLD PRICE CHECKER\n\n"
         f"เวลาไทย: {checked_at_th}\n"
-        f"ราคา: {quote['close']} {quote['currency']}\n"
+        f"ราคา: {fmt_number(quote['close'], 3)} {quote['currency']}\n"
         f"เปลี่ยนแปลง: {change_abs:+.3f} ({change_percent:+.2f}%)\n"
         f"Symbol: {quote['symbol']} ({quote['description']})\n"
         f"Exchange: {quote['exchange']}\n"
-        f"Source: {quote['source']}\n"
-        f"Chart: {quote['chart_url']}"
     )
+    for label, _ in TIMEFRAMES:
+        frame = quote["timeframes"][label]
+        ma = frame["ma"]
+        stoch = frame["stoch"]
+        macd = frame["macd"]
+        message += (
+            f"\n\nTF {label}\n"
+            f"MA20/21/50: {fmt_number(ma['ma20'])} / "
+            f"{fmt_number(ma['ma21'])} / {fmt_number(ma['ma50'])}\n"
+            f"MA100/200: {fmt_number(ma['ma100'])} / {fmt_number(ma['ma200'])}\n"
+            f"RSI: {fmt_number(frame['rsi'])}\n"
+            f"Stoch K/D: {fmt_number(stoch['k'])} / {fmt_number(stoch['d'])}\n"
+            f"MACD: {fmt_number(macd['macd'])}, "
+            f"Signal: {fmt_number(macd['signal'])}, "
+            f"Hist: {fmt_number(macd['histogram'])}"
+        )
+
+    message += f"\n\nSource: {quote['source']}\nChart: {quote['chart_url']}"
+    return message
 
 
 def send_telegram_message(text: str, insecure: bool = False) -> int:
@@ -215,6 +294,21 @@ def main() -> int:
     print(f"Gold price: {quote['close']} {quote['currency']}")
     print(f"Symbol: {quote['symbol']} ({quote['description']})")
     print(f"Change: {quote['change_abs']} ({quote['change_percent']}%)")
+    for label, _ in TIMEFRAMES:
+        frame = quote["timeframes"][label]
+        print(
+            f"TF {label}: "
+            f"MA20={fmt_number(frame['ma']['ma20'])}, "
+            f"MA21={fmt_number(frame['ma']['ma21'])}, "
+            f"MA50={fmt_number(frame['ma']['ma50'])}, "
+            f"MA100={fmt_number(frame['ma']['ma100'])}, "
+            f"MA200={fmt_number(frame['ma']['ma200'])}, "
+            f"RSI={fmt_number(frame['rsi'])}, "
+            f"Stoch={fmt_number(frame['stoch']['k'])}/{fmt_number(frame['stoch']['d'])}, "
+            f"MACD={fmt_number(frame['macd']['macd'])}, "
+            f"Signal={fmt_number(frame['macd']['signal'])}, "
+            f"Hist={fmt_number(frame['macd']['histogram'])}"
+        )
     print(f"Checked at UTC: {quote['checked_at_utc']}")
     print(f"Source: {quote['source']}")
     return 0
