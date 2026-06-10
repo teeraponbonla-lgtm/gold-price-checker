@@ -20,5 +20,11 @@ jobs:
         with:
           python-version: "3.12"
 
-      - name: Check latest gold price
+      - name: Check latest gold price and send Telegram
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          TELEGRAM_GROUP_CHAT_ID_001: ${{ secrets.TELEGRAM_GROUP_CHAT_ID_001 }}
+          TELEGRAM_GROUP_CHAT_ID_002: ${{ secrets.TELEGRAM_GROUP_CHAT_ID_002 }}
+          TELEGRAM_GROUP_CHAT_ID_003: ${{ secrets.TELEGRAM_GROUP_CHAT_ID_003 }}
         run: python check_gold_price.py --json
