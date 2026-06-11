@@ -199,4 +199,4 @@ def format_quote(row: dict[str, Any]) -> dict[str, Any]:
 
     return {
         "checked_at_utc": now,
-        "source":
+        "source": "TradingView
