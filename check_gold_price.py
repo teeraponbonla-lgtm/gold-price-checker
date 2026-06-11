@@ -14,7 +14,6 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
-
 TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/global/scan"
 BASE_COLUMNS = [
     "name",
@@ -28,8 +27,10 @@ BASE_COLUMNS = [
     "currency",
     "update_mode",
 ]
+# เพิ่ม M30 เข้ามาในรายการ
 TIMEFRAMES = [
     ("M15", "15"),
+    ("M30", "30"),
     ("H1", "60"),
     ("H4", "240"),
     ("D1", ""),
@@ -120,35 +121,82 @@ def fetch_quote(symbols: list[str], insecure: bool = False) -> dict[str, Any]:
     )
 
 
+def analyze_signals(ma_dict: dict, rsi_val: float | None, stoch_dict: dict, macd_dict: dict) -> dict[str, str]:
+    """ประมวลผลเงื่อนไขต่างๆ เพื่อหาจุดเข้า BUY / SELL / WAIT"""
+    signals = {"ma": "WAIT", "rsi": "WAIT", "stoch": "WAIT", "macd": "WAIT"}
+
+    # 1. เงื่อนไข MA: เรียงตัวกันไม่ได้พันกัน
+    ma_vals = [ma_dict['ma20'], ma_dict['ma21'], ma_dict['ma50'], ma_dict['ma100'], ma_dict['ma200']]
+    if all(v is not None for v in ma_vals):
+        if ma_vals[0] > ma_vals[1] > ma_vals[2] > ma_vals[3] > ma_vals[4]:
+            signals["ma"] = "BUY"
+        elif ma_vals[0] < ma_vals[1] < ma_vals[2] < ma_vals[3] < ma_vals[4]:
+            signals["ma"] = "SELL"
+
+    # 2. เงื่อนไข RSI
+    if rsi_val is not None:
+        if rsi_val >= 70:
+            signals["rsi"] = "SELL"
+        elif rsi_val <= 30:
+            signals["rsi"] = "BUY"
+
+    # 3. เงื่อนไข Stochastic
+    k, d = stoch_dict['k'], stoch_dict['d']
+    if k is not None and d is not None:
+        if k < d and d >= 80:  # ตัดลงในโซน Overbought
+            signals["stoch"] = "SELL"
+        elif k > d and d <= 20:  # ตัดขึ้นในโซน Oversold
+            signals["stoch"] = "BUY"
+
+    # 4. เงื่อนไข MACD
+    m_val, sig, hist = macd_dict['macd'], macd_dict['signal'], macd_dict['histogram']
+    if all(v is not None for v in (m_val, sig, hist)):
+        if m_val < sig and hist < 0:
+            signals["macd"] = "SELL"
+        elif m_val > sig and hist > 0:
+            signals["macd"] = "BUY"
+
+    return signals
+
+
 def format_quote(row: dict[str, Any]) -> dict[str, Any]:
     values = row["values"]
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     indicators = {}
     offset = len(BASE_COLUMNS)
+    
     for label, _ in TIMEFRAMES:
         frame_values = values[offset : offset + len(INDICATOR_COLUMNS)]
         macd = frame_values[8]
         macd_signal = frame_values[9]
+        
+        frame_ma = {
+            "ma20": frame_values[0],
+            "ma21": frame_values[1],
+            "ma50": frame_values[2],
+            "ma100": frame_values[3],
+            "ma200": frame_values[4],
+        }
+        frame_rsi = frame_values[5]
+        frame_stoch = {
+            "k": frame_values[6],
+            "d": frame_values[7],
+        }
+        frame_macd = {
+            "macd": macd,
+            "signal": macd_signal,
+            "histogram": macd - macd_signal if macd is not None and macd_signal is not None else None,
+        }
+
+        # ประมวลผลสัญญาณ
+        signals = analyze_signals(frame_ma, frame_rsi, frame_stoch, frame_macd)
+
         indicators[label] = {
-            "ma": {
-                "ma20": frame_values[0],
-                "ma21": frame_values[1],
-                "ma50": frame_values[2],
-                "ma100": frame_values[3],
-                "ma200": frame_values[4],
-            },
-            "rsi": frame_values[5],
-            "stoch": {
-                "k": frame_values[6],
-                "d": frame_values[7],
-            },
-            "macd": {
-                "macd": macd,
-                "signal": macd_signal,
-                "histogram": macd - macd_signal
-                if macd is not None and macd_signal is not None
-                else None,
-            },
+            "ma": frame_ma,
+            "rsi": frame_rsi,
+            "stoch": frame_stoch,
+            "macd": frame_macd,
+            "signals": signals,
         }
         offset += len(INDICATOR_COLUMNS)
 
@@ -176,12 +224,20 @@ def fmt_number(value: Any, digits: int = 2) -> str:
     return f"{float(value):,.{digits}f}"
 
 
+def signal_icon(status: str) -> str:
+    """แปลงข้อความสถานะเป็นไอคอนสีให้ดูง่ายขึ้น"""
+    if status == "BUY": return "🟢BUY"
+    if status == "SELL": return "🔴SELL"
+    return "⚪WAIT"
+
+
 def telegram_message(quote: dict[str, Any]) -> str:
     checked_at_th = (datetime.now(timezone.utc) + timedelta(hours=7)).strftime(
         "%d/%m/%Y %H:%M"
     )
     change_abs = quote["change_abs"]
     change_percent = quote["change_percent"]
+    
     message = (
         "AI GOLD PRICE CHECKER\n\n"
         f"เวลาไทย: {checked_at_th}\n"
@@ -190,6 +246,13 @@ def telegram_message(quote: dict[str, Any]) -> str:
         f"Symbol: {quote['symbol']} ({quote['description']})\n"
         f"Exchange: {quote['exchange']}\n"
     )
+    
+    # เพิ่มส่วนสรุปสัญญาณไว้ใต้ Exchange ทันที
+    message += "\n📊 สรุปสัญญาณเทคนิค:\n"
+    for label, _ in TIMEFRAMES:
+        sigs = quote["timeframes"][label]["signals"]
+        message += f"[{label}] MA:{signal_icon(sigs['ma'])} | STOCH:{signal_icon(sigs['stoch'])} | RSI:{signal_icon(sigs['rsi'])} | MACD:{signal_icon(sigs['macd'])}\n"
+
     for label, _ in TIMEFRAMES:
         frame = quote["timeframes"][label]
         ma = frame["ma"]
@@ -294,6 +357,13 @@ def main() -> int:
     print(f"Gold price: {quote['close']} {quote['currency']}")
     print(f"Symbol: {quote['symbol']} ({quote['description']})")
     print(f"Change: {quote['change_abs']} ({quote['change_percent']}%)")
+    
+    print("\n[Technical Signals Summary]")
+    for label, _ in TIMEFRAMES:
+        sigs = quote["timeframes"][label]["signals"]
+        print(f"[{label}] MA: {sigs['ma']}, STOCH: {sigs['stoch']}, RSI: {sigs['rsi']}, MACD: {sigs['macd']}")
+    
+    print("\n[Details]")
     for label, _ in TIMEFRAMES:
         frame = quote["timeframes"][label]
         print(
@@ -309,7 +379,7 @@ def main() -> int:
             f"Signal={fmt_number(frame['macd']['signal'])}, "
             f"Hist={fmt_number(frame['macd']['histogram'])}"
         )
-    print(f"Checked at UTC: {quote['checked_at_utc']}")
+    print(f"\nChecked at UTC: {quote['checked_at_utc']}")
     print(f"Source: {quote['source']}")
     return 0
 
