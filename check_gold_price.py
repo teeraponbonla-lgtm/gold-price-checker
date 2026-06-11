@@ -14,6 +14,7 @@ import urllib.request
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
+
 TRADINGVIEW_SCAN_URL = "https://scanner.tradingview.com/global/scan"
 BASE_COLUMNS = [
     "name",
@@ -27,7 +28,6 @@ BASE_COLUMNS = [
     "currency",
     "update_mode",
 ]
-# เพิ่ม M30 เข้ามาในรายการ
 TIMEFRAMES = [
     ("M15", "15"),
     ("M30", "30"),
@@ -122,10 +122,9 @@ def fetch_quote(symbols: list[str], insecure: bool = False) -> dict[str, Any]:
 
 
 def analyze_signals(ma_dict: dict, rsi_val: float | None, stoch_dict: dict, macd_dict: dict) -> dict[str, str]:
-    """ประมวลผลเงื่อนไขต่างๆ เพื่อหาจุดเข้า BUY / SELL / WAIT"""
     signals = {"ma": "WAIT", "rsi": "WAIT", "stoch": "WAIT", "macd": "WAIT"}
 
-    # 1. เงื่อนไข MA: เรียงตัวกันไม่ได้พันกัน
+    # 1. เงื่อนไข MA ทั้ง 20,21,50,100,200 อยู่เรียงกันไม่ได้พันกันอยู่ในราคาเดียวกัน
     ma_vals = [ma_dict['ma20'], ma_dict['ma21'], ma_dict['ma50'], ma_dict['ma100'], ma_dict['ma200']]
     if all(v is not None for v in ma_vals):
         if ma_vals[0] > ma_vals[1] > ma_vals[2] > ma_vals[3] > ma_vals[4]:
@@ -133,28 +132,28 @@ def analyze_signals(ma_dict: dict, rsi_val: float | None, stoch_dict: dict, macd
         elif ma_vals[0] < ma_vals[1] < ma_vals[2] < ma_vals[3] < ma_vals[4]:
             signals["ma"] = "SELL"
 
-    # 2. เงื่อนไข RSI
+    # 2. เงื่อนไข Stochastic Oscillator (Stoch K/D)
+    k, d = stoch_dict['k'], stoch_dict['d']
+    if k is not None and d is not None:
+        if k < d and d >= 80:
+            signals["stoch"] = "SELL"
+        elif k > d and d <= 20:
+            signals["stoch"] = "BUY"
+
+    # 3. เงื่อนไข Relative Strength Index (RSI)
     if rsi_val is not None:
         if rsi_val >= 70:
             signals["rsi"] = "SELL"
         elif rsi_val <= 30:
             signals["rsi"] = "BUY"
 
-    # 3. เงื่อนไข Stochastic
-    k, d = stoch_dict['k'], stoch_dict['d']
-    if k is not None and d is not None:
-        if k < d and d >= 80:  # ตัดลงในโซน Overbought
-            signals["stoch"] = "SELL"
-        elif k > d and d <= 20:  # ตัดขึ้นในโซน Oversold
-            signals["stoch"] = "BUY"
-
-    # 4. เงื่อนไข MACD
+    # 4. เงื่อนไข MACD (Moving Average Convergence Divergence)
     m_val, sig, hist = macd_dict['macd'], macd_dict['signal'], macd_dict['histogram']
     if all(v is not None for v in (m_val, sig, hist)):
-        if m_val < sig and hist < 0:
-            signals["macd"] = "SELL"
-        elif m_val > sig and hist > 0:
+        if m_val > sig and hist > 0:
             signals["macd"] = "BUY"
+        elif m_val < sig and hist < 0:
+            signals["macd"] = "SELL"
 
     return signals
 
@@ -164,7 +163,6 @@ def format_quote(row: dict[str, Any]) -> dict[str, Any]:
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     indicators = {}
     offset = len(BASE_COLUMNS)
-    
     for label, _ in TIMEFRAMES:
         frame_values = values[offset : offset + len(INDICATOR_COLUMNS)]
         macd = frame_values[8]
@@ -188,7 +186,6 @@ def format_quote(row: dict[str, Any]) -> dict[str, Any]:
             "histogram": macd - macd_signal if macd is not None and macd_signal is not None else None,
         }
 
-        # ประมวลผลสัญญาณ
         signals = analyze_signals(frame_ma, frame_rsi, frame_stoch, frame_macd)
 
         indicators[label] = {
@@ -224,11 +221,12 @@ def fmt_number(value: Any, digits: int = 2) -> str:
     return f"{float(value):,.{digits}f}"
 
 
-def signal_icon(status: str) -> str:
-    """แปลงข้อความสถานะเป็นไอคอนสีให้ดูง่ายขึ้น"""
-    if status == "BUY": return "🟢BUY"
-    if status == "SELL": return "🔴SELL"
-    return "⚪WAIT"
+def signal_emoji(status: str) -> str:
+    if status == "BUY":
+        return "🟢"
+    if status == "SELL":
+        return "🔴"
+    return "⚪"
 
 
 def telegram_message(quote: dict[str, Any]) -> str:
@@ -239,19 +237,28 @@ def telegram_message(quote: dict[str, Any]) -> str:
     change_percent = quote["change_percent"]
     
     message = (
-        "AI GOLD PRICE CHECKER\n\n"
-        f"เวลาไทย: {checked_at_th}\n"
-        f"ราคา: {fmt_number(quote['close'], 3)} {quote['currency']}\n"
-        f"เปลี่ยนแปลง: {change_abs:+.3f} ({change_percent:+.2f}%)\n"
-        f"Symbol: {quote['symbol']} ({quote['description']})\n"
-        f"Exchange: {quote['exchange']}\n"
+        f"🏦 {quote['symbol']} ({quote['description']})
+"
+        f"💵 Price: {fmt_number(quote['close'], 3)} {quote['currency']} [{change_abs:+.3f} ({change_percent:+.2f}%)]
+"
+        f"🕒 {checked_at_th} (เวลาไทย)
+
+"
+        "📊 SIGNALS DASHBOARD
+"
+        "`TF  | MA | STO| RSI| MAC`
+"
     )
     
-    # เพิ่มส่วนสรุปสัญญาณไว้ใต้ Exchange ทันที
-    message += "\n📊 สรุปสัญญาณเทคนิค:\n"
     for label, _ in TIMEFRAMES:
         sigs = quote["timeframes"][label]["signals"]
-        message += f"[{label}] MA:{signal_icon(sigs['ma'])} | STOCH:{signal_icon(sigs['stoch'])} | RSI:{signal_icon(sigs['rsi'])} | MACD:{signal_icon(sigs['macd'])}\n"
+        lbl_pad = label if len(label) == 3 else f"{label} "
+        message += f"`{lbl_pad} | {signal_emoji(sigs['ma'])}  | {signal_emoji(sigs['stoch'])}  | {signal_emoji(sigs['rsi'])}  | {signal_emoji(sigs['macd'])} `
+"
+        
+    message += "
+━━━━━━━━━━━━━━━
+"
 
     for label, _ in TIMEFRAMES:
         frame = quote["timeframes"][label]
@@ -259,18 +266,24 @@ def telegram_message(quote: dict[str, Any]) -> str:
         stoch = frame["stoch"]
         macd = frame["macd"]
         message += (
-            f"\n\nTF {label}\n"
-            f"MA20/21/50: {fmt_number(ma['ma20'])} / "
-            f"{fmt_number(ma['ma21'])} / {fmt_number(ma['ma50'])}\n"
-            f"MA100/200: {fmt_number(ma['ma100'])} / {fmt_number(ma['ma200'])}\n"
-            f"RSI: {fmt_number(frame['rsi'])}\n"
-            f"Stoch K/D: {fmt_number(stoch['k'])} / {fmt_number(stoch['d'])}\n"
-            f"MACD: {fmt_number(macd['macd'])}, "
-            f"Signal: {fmt_number(macd['signal'])}, "
-            f"Hist: {fmt_number(macd['histogram'])}"
+            f"
+🔹 [ {label} ]
+"
+            f"• MA (20/21/50): {fmt_number(ma['ma20'])} / {fmt_number(ma['ma21'])} / {fmt_number(ma['ma50'])}
+"
+            f"• MA (100/200): {fmt_number(ma['ma100'])} / {fmt_number(ma['ma200'])}
+"
+            f"• RSI: {fmt_number(frame['rsi'])}
+"
+            f"• Stoch (K/D): {fmt_number(stoch['k'])} / {fmt_number(stoch['d'])}
+"
+            f"• MACD / Sig / Hist: {fmt_number(macd['macd'])} / {fmt_number(macd['signal'])} / {fmt_number(macd['histogram'])}"
         )
 
-    message += f"\n\nSource: {quote['source']}\nChart: {quote['chart_url']}"
+    message += f"
+
+Source: {quote['source']}
+Chart: {quote['chart_url']}"
     return message
 
 
@@ -357,13 +370,6 @@ def main() -> int:
     print(f"Gold price: {quote['close']} {quote['currency']}")
     print(f"Symbol: {quote['symbol']} ({quote['description']})")
     print(f"Change: {quote['change_abs']} ({quote['change_percent']}%)")
-    
-    print("\n[Technical Signals Summary]")
-    for label, _ in TIMEFRAMES:
-        sigs = quote["timeframes"][label]["signals"]
-        print(f"[{label}] MA: {sigs['ma']}, STOCH: {sigs['stoch']}, RSI: {sigs['rsi']}, MACD: {sigs['macd']}")
-    
-    print("\n[Details]")
     for label, _ in TIMEFRAMES:
         frame = quote["timeframes"][label]
         print(
@@ -379,7 +385,7 @@ def main() -> int:
             f"Signal={fmt_number(frame['macd']['signal'])}, "
             f"Hist={fmt_number(frame['macd']['histogram'])}"
         )
-    print(f"\nChecked at UTC: {quote['checked_at_utc']}")
+    print(f"Checked at UTC: {quote['checked_at_utc']}")
     print(f"Source: {quote['source']}")
     return 0
 
